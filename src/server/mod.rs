@@ -419,6 +419,41 @@ fn warm_base_name(app: &AppState) -> String {
 /// How often a running server checks that a standby still exists.
 const WARM_STANDBY_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
+/// The minimum gap between standby respawn attempts driven by the periodic
+/// check (tenax issue #1990). Every spawn writes `<base>.spawnat`, so when a
+/// standby never settles — the spawn dies before registering, or its registry
+/// is misread — the next check sees a young stamp and waits instead of
+/// spawning again. On Windows each attempt is one hidden console window;
+/// unchecked, the 10 s check produced ~6 dead spawns a minute forever.
+/// Claim-refill and startup spawns bypass this: they only run when a real
+/// standby was just consumed, which is the case that must stay instant.
+const WARM_RESPAWN_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Whether a periodic respawn may proceed given the age of the last spawn
+/// attempt (`None` = no stamp, no attempt ever recorded).
+fn warm_respawn_due(stamp_age: Option<Duration>) -> bool {
+    stamp_age.map_or(true, |age| age >= WARM_RESPAWN_MIN_INTERVAL)
+}
+
+/// Age of the `<base>.spawnat` stamp, or None when there is none to read.
+fn warm_spawn_stamp_age(base: &str) -> Option<Duration> {
+    stamp_file_age(&crate::paths::spawnat_file(base))
+}
+
+/// mtime age of a stamp file; a future mtime reads as "just written".
+fn stamp_file_age(path: &str) -> Option<Duration> {
+    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(std::time::SystemTime::now().duration_since(mtime).unwrap_or(Duration::ZERO))
+}
+
+/// Record a standby spawn attempt. Written before the spawn syscall so a
+/// spawn whose process dies instantly is still bounded by the gate. The
+/// body names the spawned pid for debuggability; only the mtime is read.
+fn warm_spawn_stamp(base: &str) {
+    let path = crate::paths::spawnat_file(base);
+    let _ = std::fs::write(&path, format!("{}", std::process::id()));
+}
+
 /// Put a standby back if there is not one.
 ///
 /// `spawn_warm_server` was only ever called from two places, a server starting
@@ -442,6 +477,13 @@ fn ensure_warm_standby(app: &AppState) {
     // a standby that was never started looks like too, so both fall through to
     // the spawner rather than being assumed healthy.
     if crate::session::registry_pid_anchor_alive(&warm_base_name(app)) == Some(true) {
+        return;
+    }
+    // Bound retries so a standby that never registers cannot be re-attempted
+    // every check tick (#1990). The stamp is shared across every server in
+    // the namespace, so N live sessions cannot each pay a spawn.
+    if !warm_respawn_due(warm_spawn_stamp_age(&warm_base_name(app))) {
+        warm_debug("periodic check: standby still missing, but a spawn was attempted recently -- waiting");
         return;
     }
     warm_debug("periodic check: no live standby -- respawning");
@@ -494,6 +536,39 @@ fn check_warm_standby_orphaned(app: &AppState) -> crate::session::WarmStandbyVer
     crate::session::warm_standby_verdict(&facts)
 }
 
+/// What the probe of an existing `__warm__.port` established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmVerify {
+    /// The server at the port answered AUTH + `display-message` as `__warm__`.
+    Genuine,
+    /// A live server answered, but under a real session name: the pointer is
+    /// stale (the standby was claimed and rekeyed, releasing the mutex), so
+    /// clearing it and spawning a replacement is correct.
+    OtherSession,
+    /// No conclusive answer — unreadable port/key, refused connect, or a
+    /// timed-out/failed AUTH round-trip. The owner may still be alive.
+    Unreachable,
+}
+
+/// Whether `spawn_warm_server` should spawn after its probe produced
+/// `verify`, given whether the `.pid` anchor names a live psmux
+/// (`owner_alive`). Kept free of I/O so the decision is exhaustively testable.
+///
+/// The case that matters is `Unreachable` + a live owner (tenax issue #1990):
+/// the owner still holds the `__warm__` session mutex, so a spawned sibling
+/// exits on entry without registering — a guaranteed-dead spawn, and the
+/// 10 s `ensure_warm_standby` check turned that into ~6 dead spawns a minute.
+/// `OtherSession` spawns regardless: a claim rekeyed the mutex away, so the
+/// name is free. A dead/absent anchor with `Unreachable` is the ordinary
+/// stale-registry sweep.
+fn warm_spawn_helps(verify: WarmVerify, owner_alive: bool) -> bool {
+    match verify {
+        WarmVerify::Genuine => false,
+        WarmVerify::OtherSession => true,
+        WarmVerify::Unreachable => !owner_alive,
+    }
+}
+
 /// Spawn a standby "warm server" process that pre-loads config + shell.
 /// When `psmux new-session` is run later, the CLI claims this warm server
 /// via `claim-session` instead of cold-spawning, making session creation
@@ -524,7 +599,7 @@ fn spawn_warm_server(app: &AppState) {
         // claimed session.  That server answers TCP connects but is NOT warm,
         // so returning early here means warm never re-establishes and every
         // subsequent open stays cold (~1-5s) until the pointer is manually removed.
-        let mut is_genuine_warm = false;
+        let mut verify = WarmVerify::Unreachable;
         if let Ok(port_str) = std::fs::read_to_string(&warm_port_path) {
             if let Ok(port) = port_str.trim().parse::<u16>() {
                 let addr = format!("127.0.0.1:{}", port);
@@ -546,13 +621,14 @@ fn spawn_warm_server(app: &AppState) {
                             ) {
                                 Ok(resp) if resp.trim() == "__warm__" => {
                                     warm_debug("early-return: existing warm verified alive");
-                                    is_genuine_warm = true;
+                                    verify = WarmVerify::Genuine;
                                 }
                                 Ok(resp) => {
                                     warm_debug(&format!(
                                         "warm port reachable but session='{}' (not __warm__) — treating as stale",
                                         resp.trim()
                                     ));
+                                    verify = WarmVerify::OtherSession;
                                 }
                                 Err(_) => {
                                     warm_debug("warm port reachable but auth/query failed — treating as stale");
@@ -563,7 +639,19 @@ fn spawn_warm_server(app: &AppState) {
                 }
             }
         }
-        if is_genuine_warm {
+        let owner_alive =
+            crate::session::registry_pid_anchor_alive(&warm_base) == Some(true);
+        if !warm_spawn_helps(verify, owner_alive) {
+            if verify == WarmVerify::Unreachable {
+                // The .pid anchor names a live psmux, so the __warm__ mutex
+                // is still held: a spawned sibling exits on entry without
+                // ever registering — the dead-spawn churn of tenax #1990.
+                // The owner rewrites its registry files on its own 5s tick,
+                // so deleting them only buys thrash. Leave everything; the
+                // next checks keep trying, and the respawn stamp bounds any
+                // retry.
+                warm_debug("warm unreachable but its pid anchor is alive — leaving registry, not spawning a duplicate");
+            }
             return;
         }
         // Stale or wrong-server port file — remove it (and matching key/sid files)
@@ -574,6 +662,7 @@ fn spawn_warm_server(app: &AppState) {
         let warm_sid_path = crate::paths::sid_file(&warm_base);
         let _ = std::fs::remove_file(&warm_sid_path);
     }
+    warm_spawn_stamp(&warm_base);
     warm_debug("SPAWNING new warm server");
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
     let mut args: Vec<String> = vec!["server".into(), "-s".into(), "__warm__".into()];
@@ -8466,6 +8555,9 @@ mod test_issue674_claim_window_name;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue677_warm_spawn_lock.rs"]
 mod test_issue677_warm_spawn_lock;
+#[cfg(test)]
+#[path = "../../tests-rs/test_tenax1990_warm_respawn.rs"]
+mod test_tenax1990_warm_respawn;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue706_config_warnings_reply.rs"]

@@ -226,6 +226,16 @@ pub fn spawnlock_file(session: impl AsRef<str>) -> String {
     format!("{}\\{}.spawnlock", psmux_dir(), session.as_ref())
 }
 
+/// Path to a session's `.spawnat` file: its mtime is the last warm-standby
+/// spawn attempt, written by every code path that spawns one. The periodic
+/// `ensure_warm_standby` check uses it to bound respawns when a standby
+/// never settles (tenax issue #1990): a spawn that produced no live standby
+/// gets retried per-interval, not per-check, and the stamp being a file makes
+/// the bound apply across every server in the namespace, not per process.
+pub fn spawnat_file(session: impl AsRef<str>) -> String {
+    format!("{}\\{}.spawnat", psmux_dir(), session.as_ref())
+}
+
 /// Path to a session's `.act` file: the last-activity stamp (Unix epoch
 /// microseconds, ASCII) that bare CLI routing ranks candidates by.
 ///

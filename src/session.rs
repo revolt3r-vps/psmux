@@ -406,7 +406,7 @@ fn cleanup_stale_port_files_in(psmux_dir: &Path) {
 /// Registry file extensions that only ever exist as satellites of a `.port`
 /// entry. Anything else in the data dir (`next_session_id`, its `.lock`, debug
 /// logs, the `instances/` and `servers/` subdirectories) is never touched.
-const ORPHAN_REGISTRY_EXTS: &[&str] = &["sid", "key", "pid", "spawnlock", "act"];
+const ORPHAN_REGISTRY_EXTS: &[&str] = &["sid", "key", "pid", "spawnlock", "spawnat", "act"];
 
 /// How long a `.port`-less registry file must sit untouched before it is
 /// considered abandoned (issue #530).
