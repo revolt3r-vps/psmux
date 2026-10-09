@@ -12,8 +12,9 @@
 //!   on the `__warm__` session mutex.
 //!
 //! The fix is two rules, kept pure here: a shared `.spawnat` stamp bounds
-//! periodic respawns to one per interval, and a live `.pid` anchor vetoes a
-//! spawn whose outcome is already decided by the mutex.
+//! periodic respawns to one per interval, and a live `.pid` anchor vetoes the
+//! doomed spawn — the wedged owner is ended by identity instead, so the next
+//! gated check replaces it for real.
 
 use super::*;
 
@@ -26,7 +27,11 @@ fn respawn_is_due_when_never_attempted() {
 /// A spawn attempted less than the interval ago blocks the periodic check.
 #[test]
 fn respawn_is_not_due_inside_the_interval() {
-    for age in [Duration::ZERO, Duration::from_secs(1), WARM_RESPAWN_MIN_INTERVAL - Duration::from_secs(1)] {
+    for age in [
+        Duration::ZERO,
+        Duration::from_secs(1),
+        WARM_RESPAWN_MIN_INTERVAL - Duration::from_secs(1),
+    ] {
         assert!(
             !warm_respawn_due(Some(age)),
             "age {:?} is inside the interval",
@@ -44,36 +49,54 @@ fn respawn_is_due_again_after_the_interval() {
 
 /// The churn case itself: the probe cannot reach the standby but its `.pid`
 /// anchor names a live psmux. The owner still holds the `__warm__` mutex, so
-/// the spawn would exit on entry — spawning must be skipped, not repeated.
+/// a spawned sibling would exit on entry. The fix ends the wedged owner by
+/// identity; the respawn happens on a later, stamp-gated check.
 #[test]
-fn unreachable_warm_with_live_owner_does_not_spawn() {
-    assert!(!warm_spawn_helps(WarmVerify::Unreachable, true));
+fn unreachable_warm_with_live_owner_ends_the_owner() {
+    assert_eq!(
+        warm_spawn_action(WarmVerify::Unreachable, true),
+        WarmSpawnAction::EndOwner
+    );
 }
 
 /// A claimed standby leaves the `.port` pointing at a real session that
 /// answers under its own name; the mutex was released by the claim's rekey,
-/// so spawning is the way the pool refills.
+/// so spawning is the way the pool refills — even if a stale `.pid` still
+/// names that now-claimed process.
 #[test]
 fn stale_pointer_to_claimed_session_spawns() {
-    assert!(warm_spawn_helps(WarmVerify::OtherSession, true));
-    assert!(warm_spawn_helps(WarmVerify::OtherSession, false));
+    assert_eq!(
+        warm_spawn_action(WarmVerify::OtherSession, true),
+        WarmSpawnAction::Spawn
+    );
+    assert_eq!(
+        warm_spawn_action(WarmVerify::OtherSession, false),
+        WarmSpawnAction::Spawn
+    );
 }
 
 /// Dead anchor or no anchor at all: the registry is stale, sweep and spawn.
 #[test]
 fn unreachable_warm_with_dead_owner_spawns() {
-    assert!(warm_spawn_helps(WarmVerify::Unreachable, false));
+    assert_eq!(
+        warm_spawn_action(WarmVerify::Unreachable, false),
+        WarmSpawnAction::Spawn
+    );
 }
 
-/// A genuine standby is never re-spawned.
+/// A genuine standby is never re-spawned and its owner is never touched.
 #[test]
 fn genuine_warm_never_spawns() {
-    assert!(!warm_spawn_helps(WarmVerify::Genuine, true));
-    assert!(!warm_spawn_helps(WarmVerify::Genuine, false));
+    for alive in [true, false] {
+        assert_eq!(
+            warm_spawn_action(WarmVerify::Genuine, alive),
+            WarmSpawnAction::Leave
+        );
+    }
 }
 
 /// The stamp read itself: missing file is "no attempt", a fresh file is a
-/// young stamp, and a stale one is old enough to retry.
+/// young stamp.
 #[test]
 fn stamp_file_age_reports_absent_fresh_and_stale() {
     let dir = std::env::temp_dir().join(format!(

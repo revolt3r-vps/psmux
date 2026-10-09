@@ -550,22 +550,39 @@ enum WarmVerify {
     Unreachable,
 }
 
-/// Whether `spawn_warm_server` should spawn after its probe produced
-/// `verify`, given whether the `.pid` anchor names a live psmux
-/// (`owner_alive`). Kept free of I/O so the decision is exhaustively testable.
+/// What `spawn_warm_server` does after its probe produced `verify`, given
+/// whether the `.pid` anchor names a live psmux (`owner_alive`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmSpawnAction {
+    /// Clear the stale registry and spawn a replacement standby.
+    Spawn,
+    /// The `.pid` owner is a live psmux that did not answer: it still holds
+    /// the `__warm__` session mutex, so a spawned sibling exits on entry —
+    /// the dead-spawn churn of tenax issue #1990. End the owner by identity;
+    /// a later check spawns the replacement.
+    EndOwner,
+    /// The standby is genuine; do nothing.
+    Leave,
+}
+
+/// The decision, kept free of I/O so it is exhaustively testable.
 ///
-/// The case that matters is `Unreachable` + a live owner (tenax issue #1990):
-/// the owner still holds the `__warm__` session mutex, so a spawned sibling
-/// exits on entry without registering — a guaranteed-dead spawn, and the
-/// 10 s `ensure_warm_standby` check turned that into ~6 dead spawns a minute.
-/// `OtherSession` spawns regardless: a claim rekeyed the mutex away, so the
-/// name is free. A dead/absent anchor with `Unreachable` is the ordinary
-/// stale-registry sweep.
-fn warm_spawn_helps(verify: WarmVerify, owner_alive: bool) -> bool {
+/// `OtherSession` always spawns: a claim rekeyed the mutex away and removed
+/// the warm `.pid`, so the name is free and the pool must refill. A live
+/// anchor under `Unreachable` can only be a wedged standby — a claimed
+/// session deletes `__warm__.pid` — so ending it is the only act that can
+/// help, and it is bounded by the respawn stamp.
+fn warm_spawn_action(verify: WarmVerify, owner_alive: bool) -> WarmSpawnAction {
     match verify {
-        WarmVerify::Genuine => false,
-        WarmVerify::OtherSession => true,
-        WarmVerify::Unreachable => !owner_alive,
+        WarmVerify::Genuine => WarmSpawnAction::Leave,
+        WarmVerify::OtherSession => WarmSpawnAction::Spawn,
+        WarmVerify::Unreachable => {
+            if owner_alive {
+                WarmSpawnAction::EndOwner
+            } else {
+                WarmSpawnAction::Spawn
+            }
+        }
     }
 }
 
@@ -623,6 +640,14 @@ fn spawn_warm_server(app: &AppState) {
                                     warm_debug("early-return: existing warm verified alive");
                                     verify = WarmVerify::Genuine;
                                 }
+                                // An empty body means the listener answered
+                                // nothing — inconclusive, like a failed read.
+                                // A wedged standby accepts the TCP connect and
+                                // returns exactly this; it must not read as a
+                                // claimed session (#1990).
+                                Ok(resp) if resp.trim().is_empty() => {
+                                    warm_debug("warm port reachable but answered empty — treating as unreachable");
+                                }
                                 Ok(resp) => {
                                     warm_debug(&format!(
                                         "warm port reachable but session='{}' (not __warm__) — treating as stale",
@@ -641,18 +666,38 @@ fn spawn_warm_server(app: &AppState) {
         }
         let owner_alive =
             crate::session::registry_pid_anchor_alive(&warm_base) == Some(true);
-        if !warm_spawn_helps(verify, owner_alive) {
-            if verify == WarmVerify::Unreachable {
-                // The .pid anchor names a live psmux, so the __warm__ mutex
-                // is still held: a spawned sibling exits on entry without
-                // ever registering — the dead-spawn churn of tenax #1990.
-                // The owner rewrites its registry files on its own 5s tick,
-                // so deleting them only buys thrash. Leave everything; the
-                // next checks keep trying, and the respawn stamp bounds any
-                // retry.
-                warm_debug("warm unreachable but its pid anchor is alive — leaving registry, not spawning a duplicate");
+        match warm_spawn_action(verify, owner_alive) {
+            WarmSpawnAction::Leave => return,
+            WarmSpawnAction::EndOwner => {
+                // A live standby that cannot answer AUTH cannot be claimed
+                // either — it is dead weight. End it by the recorded identity
+                // so its session mutex releases, then leave the registry files:
+                // the next check (bounded by the respawn stamp) spawns the
+                // replacement once the anchor reads dead. Killing is the same
+                // identity-gated terminate kill-server's fallback uses.
+                let pid_path = crate::paths::pid_file(&warm_base);
+                let ended = std::fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|s| crate::session::parse_pid_file_contents(&s))
+                    .and_then(|(pid, creation)| {
+                        let c = creation?;
+                        crate::session::confirms_identity(
+                            crate::platform::process_kill::process_creation_time(pid),
+                            c,
+                        )
+                        .then_some(pid)
+                    })
+                    .map(|pid| {
+                        crate::platform::process_kill::terminate_server_pid(pid, None);
+                        pid
+                    });
+                warm_debug(&format!(
+                    "warm unreachable but its pid anchor is alive — ended wedged standby {:?}, respawn on next check",
+                    ended
+                ));
+                return;
             }
-            return;
+            WarmSpawnAction::Spawn => {}
         }
         // Stale or wrong-server port file — remove it (and matching key/sid files)
         warm_debug("removing STALE warm port/key/sid (unreachable or not a warm server)");
