@@ -1918,6 +1918,16 @@ match cmd {
             }
         }
     }
+    "feed-pane" => {
+        // Bytes become pane OUTPUT — the parser the client's screen is
+        // drawn from — not child input (tenax #2710). Carried by
+        // TargetedSender like every request on this connection.
+        if let Some(encoded) = args.get(0) {
+            if let Some(decoded) = base64_decode(encoded) {
+                let _ = tx.send(CtrlReq::FeedPaneOutput(decoded.into_bytes()));
+            }
+        }
+    }
     "send-key" => {
         if let Some(payload) = args.get(0) {
             crate::pty_trace::mark("i", 0, payload.as_bytes());
