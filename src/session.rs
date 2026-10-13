@@ -332,6 +332,7 @@ pub fn remove_session_pid_file(port_file_base: &str) {
 /// spawn-race duplicate or a registry wipe leaves behind. Body is the same
 /// `pid:creation_filetime` as the `.pid` sentinel so a reused PID cannot
 /// inherit a dead process's claim.
+#[cfg(windows)]
 pub fn write_server_marker(pid: u32) {
     let dir = crate::paths::server_marker_dir();
     if std::fs::create_dir_all(&dir).is_err() {
@@ -343,6 +344,15 @@ pub fn write_server_marker(pid: u32) {
         format_pid_file_contents(pid, creation),
     );
 }
+
+/// tenax #2804: off Windows the marker can never be honoured — the only
+/// consumers (`read_owned_server_pids` feeding `select_orphan_pids` /
+/// `terminate_server_pid`) are stubbed no-ops, and with no
+/// `process_creation_time` every body reads `pid:0` anyway. Each dead
+/// standby still wrote one, so a churning warm pool littered
+/// `servers\<pid>` files ~1/min for the server's whole life.
+#[cfg(not(windows))]
+pub fn write_server_marker(_pid: u32) {}
 
 /// Server processes `psmux_dir` claims, as `pid -> recorded creation filetime`.
 ///
@@ -1547,7 +1557,7 @@ fn reap_orphaned_servers_in(psmux_dir: &Path) {
 /// up after itself". A lingering marker is harmless in the meantime — it names
 /// either a dead PID or, after reuse, a process whose creation time no longer
 /// matches, and neither can authorise a kill.
-fn prune_stale_server_markers(
+pub(crate) fn prune_stale_server_markers(
     psmux_dir: &Path,
     owned_pids: &std::collections::HashMap<u32, Option<u64>>,
 ) {

@@ -753,14 +753,32 @@ fn spawn_warm_server(app: &AppState) {
     }
     #[cfg(not(windows))]
     {
-        let mut cmd = std::process::Command::new(&exe);
-        for a in &args { cmd.arg(a); }
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        let _ = cmd.spawn();
+        let spawned = spawn_standby_unix(&exe, &args);
+        warm_debug(&format!("spawned warm server pid={:?}", spawned));
         drop(spawn_lock);
     }
+}
+
+/// Spawn the standby and hand its `Child` to a reaper thread (tenax
+/// #2804). A dropped `Child` is never waitpid'd, so every standby that
+/// exited early — a duplicate losing the `__warm__` mutex, or the orphan
+/// watchdog's end — stayed in the process table as a zombie, one per
+/// `WARM_RESPAWN_MIN_INTERVAL` respawn. The parked thread collects the
+/// exit the moment it lands; the handle itself is not needed elsewhere.
+/// Returns the spawned pid, mirroring the Windows log line.
+#[cfg(not(windows))]
+fn spawn_standby_unix(exe: &std::path::Path, args: &[String]) -> Option<u32> {
+    let mut cmd = std::process::Command::new(exe);
+    for a in args { cmd.arg(a); }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Some(pid)
 }
 
 /// Parse a popup dimension spec: "80" (absolute) or "95%" (percentage of term_dim).
@@ -2368,6 +2386,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Staggered off the registry tick so the two file passes do not land on the
     // same iteration.
     let mut last_warm_standby_check = Instant::now();
+    #[cfg(windows)]
+    let mut last_marker_prune = Instant::now();
     let mut last_warm_orphan_check = Instant::now();
 
     // #559: alert detection (activity/bell/monitor-silence) used to run only
@@ -2494,6 +2514,20 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         if last_registry_check.elapsed() >= Duration::from_secs(5) {
             last_registry_check = Instant::now();
             ensure_session_registry_files(&app);
+        }
+        // tenax #2804: a dead standby self-registers a `servers\<pid>`
+        // marker before it dies, and the only other sweep is the startup
+        // reaper — markers used to pile up for the server's whole life.
+        // A stale marker names a dead or recycled pid and can never
+        // authorise a kill, so pruning is cheap bookkeeping. Windows-only:
+        // off Windows the marker is never written and its liveness check
+        // (process_creation_time) has no answer.
+        #[cfg(windows)]
+        if last_marker_prune.elapsed() >= WARM_RESPAWN_MIN_INTERVAL {
+            last_marker_prune = Instant::now();
+            let dir = std::path::PathBuf::from(crate::paths::psmux_dir());
+            let owned = crate::session::read_owned_server_pids(&dir);
+            crate::session::prune_stale_server_markers(&dir, &owned);
         }
         // A standby that died used to stay dead until the next session was
         // created, which quietly turned every `new-session` back into a cold
@@ -8606,6 +8640,10 @@ mod test_issue677_warm_spawn_lock;
 #[cfg(test)]
 #[path = "../../tests-rs/test_tenax1990_warm_respawn.rs"]
 mod test_tenax1990_warm_respawn;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue2804_warm_reap.rs"]
+mod test_issue2804_warm_reap;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue706_config_warnings_reply.rs"]
