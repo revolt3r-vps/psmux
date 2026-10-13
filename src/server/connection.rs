@@ -128,7 +128,7 @@ fn auth_debug(msg: &str) {
         let tmp = std::env::var("TEMP")
             .or_else(|_| std::env::var("TMP"))
             .unwrap_or_else(|_| ".".to_string());
-        let path = format!("{}\\psmux_auth_debug.log", tmp);
+        let path = crate::paths::join_parts(&[&tmp, "psmux_auth_debug.log"]);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())

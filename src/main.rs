@@ -1858,7 +1858,7 @@ fn run_main() -> io::Result<()> {
                     let warm_port_opt = std::fs::read_to_string(&warm_port_path)
                         .ok()
                         .and_then(|s| s.trim().parse::<u16>().ok());
-                    let claim_path = format!("{}\\{}.claiming.{}", psmux_dir, warm_base, std::process::id());
+                    let claim_path = crate::paths::sep_join(&psmux_dir, &format!("{}.claiming.{}", warm_base, std::process::id()));
                     if let Some(warm_port) = warm_port_opt {
                         if std::fs::rename(&warm_port_path, &claim_path).is_ok() {
                             let warm_addr = format!("127.0.0.1:{}", warm_port);
@@ -5171,7 +5171,7 @@ fn run_main() -> io::Result<()> {
         let warm_port_opt = if warm_disabled { None } else {
             std::fs::read_to_string(&warm_port_path).ok().and_then(|s| s.trim().parse::<u16>().ok())
         };
-        let warm_claim_path = format!("{}\\{}.claiming.{}", psmux_dir, warm_base, std::process::id());
+        let warm_claim_path = crate::paths::sep_join(&psmux_dir, &format!("{}.claiming.{}", warm_base, std::process::id()));
         if let Some(port) = warm_port_opt {
             if std::fs::rename(&warm_port_path, &warm_claim_path).is_ok() {
             let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
