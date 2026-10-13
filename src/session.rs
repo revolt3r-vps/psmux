@@ -2792,7 +2792,7 @@ pub fn resolve_default_session_name() -> Option<String> {
     // `.psmuxrc` is a home-relative config file, not part of the data dir, so it
     // stays under home_dir(); `pmuxrc` and the port files live in the data dir.
     let home = crate::paths::home_dir();
-    let candidates = [format!("{}\\.psmuxrc", home), format!("{}\\pmuxrc", crate::paths::psmux_dir())];
+    let candidates = [crate::paths::join_parts(&[&home, ".psmuxrc"]), crate::paths::sep_join(&crate::paths::psmux_dir(), "pmuxrc")];
     for cfg in candidates.iter() {
         if let Ok(text) = std::fs::read_to_string(cfg) {
             let line = text.lines().find(|l| !l.trim().is_empty())?;
